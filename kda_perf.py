@@ -2,7 +2,7 @@
 """不用 ATK 的 KDA Ascend C 算子性能测试脚本。
 
 统一参数：96 head × 128 dim，seq = 16k
-  B=1, T=16384, H=96, HV=96, K=V=128, chunk_size=64, bf16
+  B=1, T=16384, H=96, HV=96, K=V=128, chunk_size=64, layout=BNSD, bf16
 支持 chunk_kda_fwd / recurrent_kda / kda_gate_cumsum 三个算子。
 
 计时方法：算子下发开销较大，因此执行 count 次（默认 1000）后取平均：
@@ -19,8 +19,8 @@ msopprof 复测（文末 hint 给出命令）。
 用法示例：
   python3 kda_perf.py --op chunk_kda_fwd
   python3 kda_perf.py --op chunk_kda_fwd --use-gate-in-kernel --safe-gate --check
-  python3 kda_perf.py --op recurrent_kda --b 2 --t 2
-  python3 kda_perf.py --op kda_gate_cumsum --use-gate-in-kernel
+  python3 kda_perf.py --op recurrent_kda --b 2 --t 2 --layout BSND
+  python3 kda_perf.py --op kda_gate_cumsum --use-gate-in-kernel --layout BSND
 
 msopprof 复测（官方口径）：
   msopprof --aic-metrics=BasicInfo \
@@ -39,7 +39,7 @@ import time
 OPS = ("chunk_kda_fwd", "recurrent_kda", "kda_gate_cumsum")
 
 # 统一参数：96 head × 128 dim，seq = 16k（head/dim 参考 ATK 模型 case，T 提升到 16k）
-#   B=1, H=96, HV=96, T=16384, K=V=128, chunk=64, BSND, BF16
+#   B=1, H=96, HV=96, T=16384, K=V=128, chunk=64, layout=BNSD, BF16
 MODEL_CASE_HINT = (
     "统一参数 96head×128dim seq=16k 可用：--t 16384 --h 96 --hv 96 "
     "--use-gate-in-kernel --safe-gate --state-v-first"
@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
         help="q/k/v dtype（recurrent_kda 仅支持 bf16，会被强制）",
     )
     parser.add_argument(
-        "--layout", choices=("BSND", "BNSD", "TND", "NTD"), default="BSND",
-        help="输入 layout（recurrent_kda/kda_gate_cumsum 仅支持 BSND/TND）",
+        "--layout", choices=("BSND", "BNSD", "TND", "NTD"), default="BNSD",
+        help="输入 layout（默认 BNSD，数据按 BNSD 顺序生成；recurrent_kda/kda_gate_cumsum 仅支持 BSND/TND，会自动回退）",
     )
     parser.add_argument("--chunk-size", type=int, choices=(64, 128), default=64)
     parser.add_argument("--scale", type=float, default=None, help="qk scale，默认 K**-0.5")
@@ -117,7 +117,8 @@ def validate_args(args: argparse.Namespace) -> None:
             print("[warn] recurrent_kda 仅支持 bf16，已强制 --dtype bf16")
             args.dtype = "bf16"
         if args.layout not in ("BSND", "TND"):
-            sys.exit("[error] recurrent_kda 仅支持 BSND/TND layout")
+            print("[warn] recurrent_kda 不支持 %s layout，已回退为 BSND" % args.layout)
+            args.layout = "BSND"
         if (args.kdim, args.vdim) not in ((128, 128), (128, 256)):
             sys.exit("[error] recurrent_kda 仅支持 K=128, V=128 或 K=128, V=256")
         if args.t > 8:
@@ -128,7 +129,8 @@ def validate_args(args: argparse.Namespace) -> None:
             print("[warn] --disable-recompute 仅对 chunk_kda_fwd 生效，已忽略")
     elif args.op == "kda_gate_cumsum":
         if args.layout not in ("BSND", "TND"):
-            sys.exit("[error] kda_gate_cumsum 仅支持 BSND/TND layout")
+            print("[warn] kda_gate_cumsum 不支持 %s layout，已回退为 BSND" % args.layout)
+            args.layout = "BSND"
         if args.use_beta_sigmoid or args.output_final_state or args.state_v_first:
             sys.exit("[error] kda_gate_cumsum 不支持 --use-beta-sigmoid/--output-final-state/--state-v-first")
 
