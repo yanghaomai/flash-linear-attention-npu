@@ -9,6 +9,9 @@
   - 平均单次 wall   = 整段墙钟时间 / count（含 Python 下发开销）
   - 平均单次 device = 单对 Event 设备侧总时长 / count（仅设备侧，参考）
 
+msprof 采集模式：设置环境变量 KDA_MS_PROFILE（任意非空、非 0/false/off/no 的值）后，
+  跳过 warmup、只执行一次算子，供 msprof/msopprof 采集干净的 kernel trace。
+
 注意：仓内官方性能口径是 msopprof 的 op_summary 中 Task Duration(us)
 （见 docs/agents/03-方案设计.md），本脚本结果只作粗略体感；最终结论请用
 msopprof 复测（文末 hint 给出命令）。
@@ -144,7 +147,7 @@ def validate_args(args: argparse.Namespace) -> None:
         sys.exit("[error] safe gate 时 lower_bound 必须在 [-5, 0) 内")
 
 
-def build_case(args: argparse.Namespace):
+def build_case(args: argparse.Namespace, do_cold_call: bool = True):
     """构造输入并返回 (call, outputs_check, config_lines)。"""
     b, t, h, hv = args.b, args.t, args.h, args.hv
     kdim, vdim = args.kdim, args.vdim
@@ -260,9 +263,10 @@ def build_case(args: argparse.Namespace):
         def check_outputs(outputs):
             return torch.isfinite(outputs.float()).all().item()
 
-    # 首次调用 + 同步：触发 executor/workspace 创建并确认可运行
-    call()
-    torch.npu.synchronize()
+    if do_cold_call:
+        # 首次调用 + 同步：触发 executor/workspace 创建并确认可运行
+        call()
+        torch.npu.synchronize()
 
     return call, check_outputs
 
@@ -308,7 +312,11 @@ def main():
         print("[warn] ASCEND_RT_VISIBLE_DEVICES=%s 已设置，忽略 --device %d"
               % (visible, args.device))
 
-    call, check_outputs = build_case(args)
+    # msprof 采集模式：KDA_MS_PROFILE 设置为任意非空、非 0/false/off/no 时生效
+    _profile_raw = os.environ.get("KDA_MS_PROFILE", "").strip().lower()
+    profile_once = _profile_raw not in ("", "0", "false", "off", "no")
+
+    call, check_outputs = build_case(args, do_cold_call=not profile_once)
 
     import torch
     try:
@@ -325,6 +333,15 @@ def main():
           % (args.use_gate_in_kernel, args.safe_gate, args.varlen,
              args.output_final_state, args.disable_recompute, args.state_v_first))
     print("[run] warmup=%d count=%d" % (args.warmup, args.count))
+
+    if profile_once:
+        # 无 warmup、只执行一次，供 msprof/msopprof 采集干净 trace
+        call()
+        torch.npu.synchronize()
+        print("[profile] KDA_MS_PROFILE 已启用：跳过 warmup，仅执行 1 次 %s。" % args.op)
+        print("[profile] 请用 msprof/msopprof 包住本脚本采集，例如：")
+        print('       msprof --application="%s" --output=./prof_out' % " ".join(sys.argv))
+        return
 
     if args.check:
         outputs = call()
