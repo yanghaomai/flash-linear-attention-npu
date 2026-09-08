@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """不用 ATK 的 KDA Ascend C 算子性能测试脚本。
 
-通过 torch_npu Event 测量设备侧耗时，支持 chunk_kda_fwd / recurrent_kda /
-kda_gate_cumsum 三个算子，供快速粗测与 A/B 对比使用。
+统一参数：96 head × 128 dim，seq = 16k
+  B=1, T=16384, H=96, HV=96, K=V=128, chunk_size=64, bf16
+支持 chunk_kda_fwd / recurrent_kda / kda_gate_cumsum 三个算子。
+
+计时方法：算子下发开销较大，因此执行 count 次（默认 1000）后取平均：
+  - 平均单次 wall   = 整段墙钟时间 / count（含 Python 下发开销）
+  - 平均单次 device = 单对 Event 设备侧总时长 / count（仅设备侧，参考）
 
 注意：仓内官方性能口径是 msopprof 的 op_summary 中 Task Duration(us)
 （见 docs/agents/03-方案设计.md），本脚本结果只作粗略体感；最终结论请用
 msopprof 复测（文末 hint 给出命令）。
 
 用法示例：
-  python3 kda_perf.py --op chunk_kda_fwd --t 8192 --h 96 --hv 96
-  python3 kda_perf.py --op chunk_kda_fwd --t 1024 --h 96 \
-      --use-gate-in-kernel --safe-gate --varlen --check
+  python3 kda_perf.py --op chunk_kda_fwd
+  python3 kda_perf.py --op chunk_kda_fwd --use-gate-in-kernel --safe-gate --check
   python3 kda_perf.py --op recurrent_kda --b 2 --t 2
-  python3 kda_perf.py --op kda_gate_cumsum --t 8192 --hv 96 --use-gate-in-kernel
+  python3 kda_perf.py --op kda_gate_cumsum --use-gate-in-kernel
 
 msopprof 复测（官方口径）：
   msopprof --aic-metrics=BasicInfo \
-      --application="python3 kda_perf.py --op chunk_kda_fwd --t 8192 --h 96" \
+      --application="python3 kda_perf.py --op chunk_kda_fwd" \
       --output=./prof_out
   随后在输出目录的 op_summary*.csv 中查看各 kernel 的 Task Duration(us)。
 """
@@ -25,26 +29,23 @@ msopprof 复测（官方口径）：
 from __future__ import annotations
 
 import argparse
-import csv
 import os
-import statistics
 import sys
 import time
 
 OPS = ("chunk_kda_fwd", "recurrent_kda", "kda_gate_cumsum")
 
-# 参考 ATK 模型 case（tests/atk/chunk_kda_fwd/atk_chunk_kda_fwd_perf.json）：
-#   B=1, H=96, HV=96, T=1024, K=V=128, chunk=64, BSND, BF16, varlen,
-#   safe_gate=true, use_gate_in_kernel=true, state_v_first=true
+# 统一参数：96 head × 128 dim，seq = 16k（head/dim 参考 ATK 模型 case，T 提升到 16k）
+#   B=1, H=96, HV=96, T=16384, K=V=128, chunk=64, BSND, BF16
 MODEL_CASE_HINT = (
-    "复刻 ATK 模型 case 可用：--t 1024 --h 96 --hv 96 --varlen "
+    "统一参数 96head×128dim seq=16k 可用：--t 16384 --h 96 --hv 96 "
     "--use-gate-in-kernel --safe-gate --state-v-first"
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="不用 ATK 测试 KDA Ascend C 算子性能（torch_npu Event 设备侧计时）",
+        description="不用 ATK 测试 KDA Ascend C 算子性能（执行 count 次取平均值，默认 1000 次）",
         epilog=f"提示：{MODEL_CASE_HINT}",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -52,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b", type=int, default=1, help="batch（TND/NTD 必须为 1）")
     parser.add_argument(
         "--t", type=int, default=None,
-        help="序列长度（默认：chunk_kda_fwd/kda_gate_cumsum 8192，recurrent_kda 2）",
+        help="序列长度（默认：chunk_kda_fwd/kda_gate_cumsum 16384，recurrent_kda 2）",
     )
     parser.add_argument(
         "--h", type=int, default=None,
@@ -86,16 +87,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-v-first", action="store_true")
     parser.add_argument("--use-beta-sigmoid", action="store_true", help="仅 recurrent_kda")
     parser.add_argument("--warmup", type=int, default=5, help="预热次数")
-    parser.add_argument("--count", type=int, default=20, help="采样次数")
+    parser.add_argument("--count", type=int, default=1000, help="执行次数（计时取 count 次总时长平均值）")
     parser.add_argument("--device", type=int, default=0, help="NPU 设备 id（未设置 ASCEND_RT_VISIBLE_DEVICES 时生效）")
     parser.add_argument("--check", action="store_true", help="额外执行一次并检查输出 finite")
-    parser.add_argument("--verbose", action="store_true", help="逐次打印耗时")
-    parser.add_argument("--csv", type=str, default=None, help="把逐次耗时写入 CSV 文件")
     args = parser.parse_args()
 
     # 按算子补默认 shape
     if args.t is None:
-        args.t = 2 if args.op == "recurrent_kda" else 8192
+        args.t = 2 if args.op == "recurrent_kda" else 16384
     if args.h is None:
         args.h = 2 if args.op == "recurrent_kda" else 96
     if args.hv is None:
@@ -268,30 +267,34 @@ def build_case(args: argparse.Namespace):
     return call, check_outputs
 
 
-def run_bench(call, warmup: int, count: int, verbose: bool):
+def run_bench(call, warmup: int, count: int):
+    """预热后执行 count 次，返回 (wall 总耗时 ms, device 总耗时 ms)。
+
+    算子下发开销较大，因此不再逐次打 Event，而是：
+      - wall：整段循环的 time.perf_counter 差值（含 Python 下发开销）；
+      - device：循环前后各打一个 Event，取设备侧总时长。
+    两者都除以 count 即得到平均单次耗时。
+    """
     import torch
 
-    times_ms = []
-    wall_start = time.perf_counter()
     for _ in range(warmup):
         call()
     torch.npu.synchronize()
-    events = []
+
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+
+    wall_start = time.perf_counter()
+    start_event.record()
     for _ in range(count):
-        start = torch.npu.Event(enable_timing=True)
-        end = torch.npu.Event(enable_timing=True)
-        start.record()
         call()
-        end.record()
-        events.append((start, end))
+    end_event.record()
     torch.npu.synchronize()
     wall_end = time.perf_counter()
-    for index, (start, end) in enumerate(events, 1):
-        ms = start.elapsed_time(end)
-        times_ms.append(ms)
-        if verbose:
-            print("  iter %3d: %.3f ms" % (index, ms))
-    return times_ms, wall_end - wall_start
+
+    wall_ms = (wall_end - wall_start) * 1000.0
+    device_ms = start_event.elapsed_time(end_event)
+    return wall_ms, device_ms
 
 
 def main():
@@ -332,22 +335,15 @@ def main():
         except Exception as error:
             print("[check] 输出检查失败: %s" % error)
 
-    times_ms, wall_sec = run_bench(call, args.warmup, args.count, args.verbose)
-    avg = statistics.mean(times_ms)
-    p50 = statistics.median(times_ms)
-    print("[result] avg=%.3f ms  min=%.3f ms  max=%.3f ms  p50=%.3f ms"
-          % (avg, min(times_ms), max(times_ms), p50))
-    print("[wall] 整个测量段 wall time %.3f s（含 Python 调度，不作为性能口径）" % wall_sec)
+    wall_ms, device_ms = run_bench(call, args.warmup, args.count)
+    print("[result] 执行 %d 次总耗时: wall=%.3f ms  device=%.3f ms"
+          % (args.count, wall_ms, device_ms))
+    print("[result] 平均单次耗时: wall=%.3f ms  device=%.3f ms"
+          % (wall_ms / args.count, device_ms / args.count))
+    print("[result] 下发开销占比 ≈ %.1f%%（(wall-device)/wall）"
+          % ((wall_ms - device_ms) / wall_ms * 100.0 if wall_ms > 0 else 0.0))
 
-    if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as file:
-            writer = csv.writer(file)
-            writer.writerow(["iter", "ms"])
-            for index, ms in enumerate(times_ms, 1):
-                writer.writerow([index, "%.6f" % ms])
-        print("[csv] 逐次耗时已写入 %s" % args.csv)
-
-    print("[hint] 以上为 torch_npu Event 设备侧计时，仅作快速对比。")
+    print("[hint] wall 为整段墙钟平均（含 Python 下发），device 为设备侧 Event 平均。")
     print("[hint] 仓内官方口径是 msopprof op_summary 的 Task Duration(us)，例如：")
     print('       msopprof --aic-metrics=BasicInfo \\')
     print('           --application="%s" \\' % " ".join(sys.argv))
