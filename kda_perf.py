@@ -181,21 +181,33 @@ def build_case(args: argparse.Namespace, do_cold_call: bool = True):
         g_shape = (hv, t, kdim) if is_rank3 else (b, hv, t, kdim)
         beta_shape = (hv, t) if is_rank3 else (b, hv, t)
 
-    q = torch.randn(q_shape, device=device, dtype=dtype)
+    # 显式 .contiguous()：保证输入按行优先（C-contiguous）存储；
+    # torch.randn/rand 默认即 contiguous，此处显式声明以防后续改动破坏布局。
+    q = torch.randn(q_shape, device=device, dtype=dtype).contiguous()
     k = torch.randn_like(q)
-    v = torch.randn(v_shape, device=device, dtype=dtype)
+    v = torch.randn(v_shape, device=device, dtype=dtype).contiguous()
 
     a_log = None
     dt_bias = None
     if args.use_gate_in_kernel:
         # raw gate：与 ATK 模型 case 类似，带 bias 的 log gate 前体
-        g = torch.randn(g_shape, device=device, dtype=torch.float32)
+        g = torch.randn(g_shape, device=device, dtype=torch.float32).contiguous()
         a_log = torch.randn(hv, device=device, dtype=torch.float32) * 0.12
         dt_bias = -3.0 + 1.65 * torch.randn(hv * kdim, device=device, dtype=torch.float32)
     else:
         # 已激活的负自然对数 gate
-        g = -0.01 * torch.rand(g_shape, device=device, dtype=torch.float32)
-    beta = torch.randn(beta_shape, device=device, dtype=torch.float32)
+        g = (-0.01 * torch.rand(g_shape, device=device, dtype=torch.float32)).contiguous()
+    beta = torch.randn(beta_shape, device=device, dtype=torch.float32).contiguous()
+
+    # 打印实际内存布局，便于核对是否按 layout 行优先存放
+    print("[layout] %s q: shape=%s stride=%s contiguous=%s"
+          % (layout, tuple(q.shape), tuple(q.stride()), q.is_contiguous()))
+    print("[layout] %s v: shape=%s stride=%s contiguous=%s"
+          % (layout, tuple(v.shape), tuple(v.stride()), v.is_contiguous()))
+    print("[layout] %s g: shape=%s stride=%s contiguous=%s"
+          % (layout, tuple(g.shape), tuple(g.stride()), g.is_contiguous()))
+    print("[layout] %s beta: shape=%s stride=%s contiguous=%s"
+          % (layout, tuple(beta.shape), tuple(beta.stride()), beta.is_contiguous()))
 
     cu_seqlens = None
     if args.varlen and args.op != "recurrent_kda":
